@@ -1,33 +1,32 @@
 //! Instanced rendering with grid-based view culling.
 //!
-//! Each visible entity is sent to the GPU as a 20-byte instance (position, velocity,
-//! swim phase) instead of raylib's 64-byte matrix. The vertex shader derives the
-//! heading from the velocity and animates the swim wiggle. Every species is one
-//! merged mesh, so the whole ocean takes one draw call per species.
+//! Each visible entity is sent to the GPU as 14 bytes (position, velocity, swim
+//! phase) instead of raylib's 64-byte matrix. The vertex shader derives the heading
+//! from the velocity and animates the swim wiggle. Every species is one merged mesh,
+//! so the whole ocean takes one draw call per species.
+//!
+//! The instance buffer mirrors the simulation's structure of arrays: one section per
+//! field. Fish are sorted by grid cell, so the visible ones form a few contiguous runs
+//! that are uploaded straight from the simulation's arrays with no CPU-side copy.
 
 const std = @import("std");
 const rl = @import("raylib");
 const rlgl = rl.gl;
 const sim = @import("sim.zig");
 
-pub const Instance = extern struct {
-    x: f32,
-    z: f32,
-    vx: f32,
-    vz: f32,
-    phase: f32,
-};
-
 const RL_FLOAT = 0x1406;
-const inst_loc_pos_vel = 14;
-const inst_loc_phase = 15;
+const RL_HALF_FLOAT = 0x140B;
+/// Attribute locations of the five per-instance fields (x, z, vx, vz, phase).
+const inst_loc_first = 10;
+const field_count = 5;
 /// Instance buffers are rotated so we never overwrite one the GPU may still be reading.
 const ring_size = 3;
 
 pub const fish_length: f32 = 1.2;
 pub const shark_length: f32 = 6.0;
-/// Above this camera height fish are drawn with the low-poly mesh.
-pub const lod_height: f32 = 140.0;
+/// Camera heights at which fish switch to the low-poly mesh, then to a single triangle.
+pub const lod_low_height: f32 = 100.0;
+pub const lod_dart_height: f32 = 700.0;
 
 const vs_source =
     \\#version 330
@@ -35,8 +34,11 @@ const vs_source =
     \\layout(location = 1) in vec2 vertexTexCoord;
     \\layout(location = 2) in vec3 vertexNormal;
     \\layout(location = 3) in vec4 vertexColor;
-    \\layout(location = 14) in vec4 instPosVel;
-    \\layout(location = 15) in float instPhase;
+    \\layout(location = 10) in float instX;
+    \\layout(location = 11) in float instZ;
+    \\layout(location = 12) in float instVX;
+    \\layout(location = 13) in float instVZ;
+    \\layout(location = 14) in float instPhase;
     \\uniform mat4 mvp;
     \\uniform float bodyLength;
     \\uniform float wiggleAmp;
@@ -48,13 +50,13 @@ const vs_source =
     \\    // Lateral swim wave that grows toward the tail (model faces +Z).
     \\    float back = clamp(0.5 - p.z / bodyLength, 0.0, 1.0);
     \\    p.x += sin(instPhase - 6.0 * p.z / bodyLength) * wiggleAmp * bodyLength * back * back;
-    \\    vec2 v = instPosVel.zw;
+    \\    vec2 v = vec2(instVX, instVZ);
     \\    float len = length(v);
     \\    vec2 d = len > 1e-4 ? v / len : vec2(0.0, 1.0);
     \\    vec3 w = vec3(p.x * d.y + p.z * d.x, p.y, -p.x * d.x + p.z * d.y);
     \\    vec3 n = vertexNormal;
     \\    fragNormal = vec3(n.x * d.y + n.z * d.x, n.y, -n.x * d.x + n.z * d.y);
-    \\    w.xz += instPosVel.xy;
+    \\    w.xz += vec2(instX, instZ);
     \\    fragTexCoord = vertexTexCoord;
     \\    fragColor = vertexColor;
     \\    gl_Position = mvp * vec4(w, 1.0);
@@ -81,23 +83,59 @@ const Species = struct {
     texture_id: u32,
     length: f32,
     wiggle: f32,
-    vbos: [ring_size]u32,
+};
 
-    fn initVbos(sp: *Species, capacity: usize) void {
-        for (&sp.vbos) |*v| v.* = rlgl.rlLoadVertexBuffer(null, @intCast(capacity * @sizeOf(Instance)), true);
+/// Byte size and GL type of each instance field, in `sim.Bodies` order.
+const field_sizes = [field_count]usize{ 4, 4, 2, 2, 2 };
+const field_gl_types = [field_count]i32{ RL_FLOAT, RL_FLOAT, RL_HALF_FLOAT, RL_HALF_FLOAT, RL_HALF_FLOAT };
+
+/// A ring of instance buffers, each holding `capacity` instances as one section per field.
+const InstanceBuffers = struct {
+    vbos: [ring_size]u32,
+    capacity: usize,
+
+    fn init(capacity: usize) InstanceBuffers {
+        var bytes: usize = 0;
+        for (field_sizes) |size| bytes += size * capacity;
+        var b: InstanceBuffers = .{ .vbos = undefined, .capacity = capacity };
+        for (&b.vbos) |*v| v.* = rlgl.rlLoadVertexBuffer(null, @intCast(bytes), true);
+        return b;
+    }
+
+    /// Byte offset of field `k`'s section.
+    fn sectionOffset(b: InstanceBuffers, k: usize) usize {
+        var offset: usize = 0;
+        for (field_sizes[0..k]) |size| offset += size * b.capacity;
+        return offset;
+    }
+
+    /// Copies `src[begin..end]` of every field into instance slots starting at `dst`.
+    fn upload(b: InstanceBuffers, slot: usize, src: sim.Bodies, begin: usize, end: usize, dst: usize) void {
+        if (end == begin) return;
+        const fields = [field_count][]const u8{
+            std.mem.sliceAsBytes(src.x),  std.mem.sliceAsBytes(src.z),     std.mem.sliceAsBytes(src.vx),
+            std.mem.sliceAsBytes(src.vz), std.mem.sliceAsBytes(src.phase),
+        };
+        for (fields, field_sizes, 0..) |bytes, size, k| {
+            const run = bytes[begin * size .. end * size];
+            rlgl.rlUpdateVertexBuffer(b.vbos[slot], run.ptr, @intCast(run.len), @intCast(b.sectionOffset(k) + dst * size));
+        }
     }
 };
 
-const Row = struct { src_begin: u32, src_end: u32, dst: u32 };
+/// A contiguous run of visible fish in the sorted arrays and where it lands in the instance buffer.
+const Run = struct { src_begin: u32, src_end: u32, dst: u32 };
+
+pub const Lod = enum { full, low_poly, dart };
 
 pub const Stats = struct {
     visible_fish: usize = 0,
     visible_sharks: usize = 0,
-    rows: usize = 0,
-    low_poly: bool = false,
+    runs: usize = 0,
+    lod: Lod = .full,
     fish_triangles: usize = 0,
-    gather_ms: f32 = 0,
-    upload_ms: f32 = 0,
+    cull_ms: f32 = 0,
+    draw_ms: f32 = 0,
 };
 
 pub const Renderer = struct {
@@ -107,14 +145,23 @@ pub const Renderer = struct {
     loc_wiggle: i32,
     loc_texture: i32,
 
-    fish_hi: Species,
-    fish_lo: Species,
+    fish_full: Species,
+    fish_low: Species,
+    fish_dart: Species,
     shark: Species,
 
-    fish_instances: []Instance,
-    shark_instances: []Instance,
-    rows: [sim.grid_dim]Row = undefined,
-    row_count: usize = 0,
+    fish_buffers: InstanceBuffers,
+    shark_buffers: InstanceBuffers,
+    /// Visible sharks are few, so they are copied into this small staging set.
+    shark_stage: sim.Bodies,
+    runs: [sim.grid_dim]Run = undefined,
+    run_count: usize = 0,
+    // Captured by `prepare` for `draw`.
+    fish_src: sim.Bodies = undefined,
+    fish_n: usize = 0,
+    shark_n: usize = 0,
+    lod: Lod = .full,
+    cull_ms: f32 = 0,
     frame: usize = 0,
     stats: Stats = .{},
 
@@ -128,61 +175,75 @@ pub const Renderer = struct {
         defer rl.unloadModel(shark_model);
         if (fish_model.meshCount == 0 or shark_model.meshCount == 0) return error.LoadModel;
 
-        var r: Renderer = .{
+        return .{
             .shader = shader,
             .loc_mvp = rl.getShaderLocation(shader, "mvp"),
             .loc_body_length = rl.getShaderLocation(shader, "bodyLength"),
             .loc_wiggle = rl.getShaderLocation(shader, "wiggleAmp"),
             .loc_texture = rl.getShaderLocation(shader, "texture0"),
-            .fish_hi = .{ .mesh = mergeModel(fish_model, fish_length, false), .texture_id = white, .length = fish_length, .wiggle = 0.12, .vbos = undefined },
-            .fish_lo = .{ .mesh = lowPolyFish(fish_length), .texture_id = white, .length = fish_length, .wiggle = 0.12, .vbos = undefined },
-            .shark = .{ .mesh = mergeModel(shark_model, shark_length, false), .texture_id = modelTexture(shark_model, white), .length = shark_length, .wiggle = 0.06, .vbos = undefined },
-            .fish_instances = try gpa.alloc(Instance, sim.fish_count),
-            .shark_instances = try gpa.alloc(Instance, sim.shark_count),
+            .fish_full = .{ .mesh = mergeModel(fish_model, fish_length, false), .texture_id = white, .length = fish_length, .wiggle = 0.12 },
+            .fish_low = .{ .mesh = lowPolyFish(fish_length), .texture_id = white, .length = fish_length, .wiggle = 0.12 },
+            .fish_dart = .{ .mesh = dartFish(fish_length), .texture_id = white, .length = fish_length, .wiggle = 0 },
+            .shark = .{ .mesh = mergeModel(shark_model, shark_length, false), .texture_id = modelTexture(shark_model, white), .length = shark_length, .wiggle = 0.06 },
+            .fish_buffers = .init(sim.fish_count),
+            .shark_buffers = .init(sim.shark_count),
+            .shark_stage = try sim.Bodies.alloc(gpa, sim.shark_count),
         };
-        // Both fish LODs read from the same instance data, so they share buffers.
-        r.fish_hi.initVbos(sim.fish_count);
-        r.fish_lo.vbos = r.fish_hi.vbos;
-        r.shark.initVbos(sim.shark_count);
-        return r;
     }
 
-    /// Culls and packs visible instances, then draws them. Must be called inside BeginMode3D.
-    pub fn draw(r: *Renderer, s: *sim.Sim, camera: rl.Camera3D) void {
+    /// Culls against the camera and captures everything `draw` needs from the simulation,
+    /// so the next step may run while this frame draws. Afterwards `draw` only reads the
+    /// captured fish arrays, which the step leaves untouched (it writes the other buffer).
+    pub fn prepare(r: *Renderer, s: *sim.Sim, camera: rl.Camera3D) void {
         const t0 = s.now();
         const view = groundFootprint(camera);
-        r.buildRows(s, view);
-        const fish_n: usize = if (r.row_count == 0) 0 else r.rows[r.row_count - 1].dst + (r.rows[r.row_count - 1].src_end - r.rows[r.row_count - 1].src_begin);
-        s.parallelFor(fish_n, gatherTask, .{ r, s });
-        const shark_n = r.gatherSharks(s, view);
-        const t1 = s.now();
+        r.buildRuns(s, view);
+        r.fish_n = if (r.run_count == 0) 0 else blk: {
+            const last = r.runs[r.run_count - 1];
+            break :blk last.dst + (last.src_end - last.src_begin);
+        };
+        r.shark_n = r.stageSharks(s, view);
+        r.fish_src = s.currentFish();
+        r.lod = if (camera.position.y > lod_dart_height) .dart else if (camera.position.y > lod_low_height) .low_poly else .full;
+        r.cull_ms = msBetween(t0, s.now());
+    }
 
-        const low_poly = camera.position.y > lod_height;
-        const fish = if (low_poly) &r.fish_lo else &r.fish_hi;
+    /// Uploads and draws what `prepare` captured. Must be called inside BeginMode3D.
+    pub fn draw(r: *Renderer, s: *const sim.Sim) void {
+        const t1 = s.now();
+        const fish_n = r.fish_n;
+        const shark_n = r.shark_n;
+        const lod = r.lod;
+        const fish = switch (lod) {
+            .full => &r.fish_full,
+            .low_poly => &r.fish_low,
+            .dart => &r.fish_dart,
+        };
         const slot = r.frame % ring_size;
         r.frame += 1;
 
+        for (r.runs[0..r.run_count]) |run| r.fish_buffers.upload(slot, r.fish_src, run.src_begin, run.src_end, run.dst);
+        r.shark_buffers.upload(slot, r.shark_stage, 0, shark_n, 0);
+
         rlgl.rlDrawRenderBatchActive();
         const mvp = rl.math.matrixMultiply(rlgl.rlGetMatrixModelview(), rlgl.rlGetMatrixProjection());
-        r.drawSpecies(fish, slot, r.fish_instances[0..fish_n], mvp);
-        r.drawSpecies(&r.shark, slot, r.shark_instances[0..shark_n], mvp);
+        r.drawSpecies(fish, r.fish_buffers, slot, fish_n, mvp);
+        r.drawSpecies(&r.shark, r.shark_buffers, slot, shark_n, mvp);
         const t2 = s.now();
 
         r.stats = .{
             .visible_fish = fish_n,
             .visible_sharks = shark_n,
-            .rows = r.row_count,
-            .low_poly = low_poly,
+            .runs = r.run_count,
+            .lod = lod,
             .fish_triangles = fish_n * @as(usize, @intCast(fish.mesh.triangleCount)),
-            .gather_ms = msBetween(t0, t1),
-            .upload_ms = msBetween(t1, t2),
+            .cull_ms = r.cull_ms,
+            .draw_ms = msBetween(t1, t2),
         };
     }
 
-    fn drawSpecies(r: *Renderer, sp: *const Species, slot: usize, instances: []const Instance, mvp: rl.Matrix) void {
-        if (instances.len == 0) return;
-        const vbo = sp.vbos[slot];
-        rlgl.rlUpdateVertexBuffer(vbo, instances.ptr, @intCast(instances.len * @sizeOf(Instance)), 0);
+    fn drawSpecies(r: *Renderer, sp: *const Species, buffers: InstanceBuffers, slot: usize, count: usize, mvp: rl.Matrix) void {
+        if (count == 0) return;
 
         rlgl.rlEnableShader(r.shader.id);
         rlgl.rlSetUniformMatrix(r.loc_mvp, mvp);
@@ -195,16 +256,16 @@ pub const Renderer = struct {
         rlgl.rlEnableTexture(sp.texture_id);
 
         _ = rlgl.rlEnableVertexArray(@intCast(sp.mesh.vaoId));
-        rlgl.rlEnableVertexBuffer(vbo);
-        rlgl.rlSetVertexAttribute(inst_loc_pos_vel, 4, RL_FLOAT, false, @sizeOf(Instance), 0);
-        rlgl.rlEnableVertexAttribute(inst_loc_pos_vel);
-        rlgl.rlSetVertexAttributeDivisor(inst_loc_pos_vel, 1);
-        rlgl.rlSetVertexAttribute(inst_loc_phase, 1, RL_FLOAT, false, @sizeOf(Instance), 16);
-        rlgl.rlEnableVertexAttribute(inst_loc_phase);
-        rlgl.rlSetVertexAttributeDivisor(inst_loc_phase, 1);
+        rlgl.rlEnableVertexBuffer(buffers.vbos[slot]);
+        for (0..field_count) |k| {
+            const loc: u32 = @intCast(inst_loc_first + k);
+            rlgl.rlSetVertexAttribute(loc, 1, field_gl_types[k], false, 0, @intCast(buffers.sectionOffset(k)));
+            rlgl.rlEnableVertexAttribute(loc);
+            rlgl.rlSetVertexAttributeDivisor(loc, 1);
+        }
 
         rlgl.rlDisableBackfaceCulling();
-        rlgl.rlDrawVertexArrayElementsInstanced(0, sp.mesh.triangleCount * 3, null, @intCast(instances.len));
+        rlgl.rlDrawVertexArrayElementsInstanced(0, sp.mesh.triangleCount * 3, null, @intCast(count));
         rlgl.rlEnableBackfaceCulling();
 
         rlgl.rlDisableVertexArray();
@@ -214,13 +275,14 @@ pub const Renderer = struct {
     }
 
     /// For each grid row the view touches, finds the visible column span. Fish are sorted
-    /// by cell in row-major order, so each span is one contiguous range of the SoA arrays.
-    fn buildRows(r: *Renderer, s: *const sim.Sim, view: Footprint) void {
-        r.row_count = 0;
-        const margin = shark_length; // generous: covers model extents and one frame of motion
+    /// by cell in row-major order, so each span is one contiguous range of the SoA arrays,
+    /// and spans of adjacent rows that touch are merged into one run.
+    fn buildRuns(r: *Renderer, s: *const sim.Sim, view: Footprint) void {
+        r.run_count = 0;
+        const margin = shark_length; // generous: covers model extents and grid staleness
+        if (view.max_z + margin < 0 or view.min_z - margin >= sim.world_size) return;
         const z_lo = cellIndex(view.min_z - margin) orelse 0;
         const z_hi = cellIndex(view.max_z + margin) orelse sim.grid_dim - 1;
-        if (view.max_z + margin < 0 or view.min_z - margin >= sim.world_size) return;
         var dst: u32 = 0;
         for (z_lo..z_hi + 1) |row_z| {
             const band_lo = @as(f32, @floatFromInt(row_z)) * sim.cell_size - margin;
@@ -233,44 +295,35 @@ pub const Renderer = struct {
             const begin = s.cell_start[row + c0];
             const end = s.cell_start[row + c1 + 1];
             if (end == begin) continue;
-            r.rows[r.row_count] = .{ .src_begin = begin, .src_end = end, .dst = dst };
-            r.row_count += 1;
+            if (r.run_count > 0 and r.runs[r.run_count - 1].src_end == begin) {
+                r.runs[r.run_count - 1].src_end = end;
+            } else {
+                r.runs[r.run_count] = .{ .src_begin = begin, .src_end = end, .dst = dst };
+                r.run_count += 1;
+            }
             dst += end - begin;
         }
     }
 
-    fn gatherSharks(r: *Renderer, s: *const sim.Sim, view: Footprint) usize {
+    fn stageSharks(r: *Renderer, s: *const sim.Sim, view: Footprint) usize {
         const sh = s.sharks;
+        const st = r.shark_stage;
         const m = shark_length;
         var n: usize = 0;
         for (0..sim.shark_count) |i| {
             const x = sh.x[i];
             const z = sh.z[i];
             if (x < view.min_x - m or x > view.max_x + m or z < view.min_z - m or z > view.max_z + m) continue;
-            r.shark_instances[n] = .{ .x = x, .z = z, .vx = sh.vx[i], .vz = sh.vz[i], .phase = sh.phase[i] };
+            st.x[n] = x;
+            st.z[n] = z;
+            st.vx[n] = sh.vx[i];
+            st.vz[n] = sh.vz[i];
+            st.phase[n] = sh.phase[i];
             n += 1;
         }
         return n;
     }
 };
-
-/// Copies output slots `begin..end` from the SoA fish arrays into interleaved instances.
-fn gatherTask(ctx: struct { *Renderer, *sim.Sim }, _: usize, begin: usize, end: usize) void {
-    const r = ctx[0];
-    const f = ctx[1].currentFish();
-    const out = r.fish_instances;
-    for (r.rows[0..r.row_count]) |row| {
-        const row_end = row.dst + (row.src_end - row.src_begin);
-        const lo = @max(begin, row.dst);
-        const hi = @min(end, row_end);
-        if (lo >= hi) continue;
-        var src = row.src_begin + (lo - row.dst);
-        for (lo..hi) |d| {
-            out[d] = .{ .x = f.x[src], .z = f.z[src], .vx = f.vx[src], .vz = f.vz[src], .phase = f.phase[src] };
-            src += 1;
-        }
-    }
-}
 
 fn cellIndex(p: f32) ?usize {
     if (p < 0) return null;
@@ -461,6 +514,31 @@ fn lowPolyFish(length: f32) rl.Mesh {
             out.colors[v * 4 + 3] = 255;
             out.indices[v] = @intCast(v);
         }
+    }
+    rl.uploadMesh(&out, false);
+    return out;
+}
+
+/// One flat triangle per fish for views where fish are a pixel or two across.
+fn dartFish(length: f32) rl.Mesh {
+    const n = 3;
+    var out = std.mem.zeroes(rl.Mesh);
+    out.vertexCount = n;
+    out.triangleCount = 1;
+    out.vertices = cAlloc(f32, n * 3);
+    out.normals = cAlloc(f32, n * 3);
+    out.texcoords = cAlloc(f32, n * 2);
+    out.colors = cAlloc(u8, n * 4);
+    out.indices = cAlloc(c_ushort, n);
+    const pts = [n][3]f32{ .{ 0, 0, 0.5 * length }, .{ 0.2 * length, 0, -0.5 * length }, .{ -0.2 * length, 0, -0.5 * length } };
+    for (pts, 0..) |p, v| {
+        for (0..3) |a| out.vertices[v * 3 + a] = p[a];
+        out.normals[v * 3 + 1] = 1;
+        out.colors[v * 4 + 0] = 230;
+        out.colors[v * 4 + 1] = 90;
+        out.colors[v * 4 + 2] = 30;
+        out.colors[v * 4 + 3] = 255;
+        out.indices[v] = @intCast(v);
     }
     rl.uploadMesh(&out, false);
     return out;

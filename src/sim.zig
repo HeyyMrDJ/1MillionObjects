@@ -1,26 +1,29 @@
 //! Simulation state and update. Everything is stored as structs of arrays and
 //! the fish are re-sorted into spatial grid order every frame with a parallel
 //! counting sort, so neighbour queries and view culling read contiguous memory.
+//!
+//! The sort keys on each fish's cell at the start of the frame, which lets the
+//! update and the scatter happen in one pass: each fish is read once, updated,
+//! and written straight to its sorted slot. Fish move well under one unit per
+//! frame, so the grid is never more than a fraction of a unit stale.
 
 const std = @import("std");
 const Io = std.Io;
 
 pub const shark_count: usize = 1000;
-pub const fish_count: usize = 1_000_000 - shark_count;
-pub const world_size: f32 = 2000.0;
+pub const fish_count: usize = 10_000_000;
+/// Sized for roughly 0.25 fish per square unit.
+pub const world_size: f32 = 6400.0;
 
-/// Fish grid: used by sharks to find prey and by the renderer for culling.
-pub const cell_size: f32 = 16.0;
+/// Fish grid: used for shark prey searches, fish threat lookups and view culling.
+/// 32 keeps the cell count (200 x 200) within the u16 used for `fish_cell`.
+pub const cell_size: f32 = 32.0;
 pub const grid_dim: usize = @intFromFloat(world_size / cell_size);
 pub const cell_count: usize = grid_dim * grid_dim;
-
-/// Shark grid: used by fish to find nearby sharks. Must be >= flee_radius.
-const shark_cell_size: f32 = 25.0;
-const shark_grid_dim: usize = @intFromFloat(world_size / shark_cell_size);
-const shark_cell_count: usize = shark_grid_dim * shark_grid_dim;
-
-/// The current field is sampled at grid nodes and bilinearly interpolated.
 const flow_dim: usize = grid_dim + 1;
+comptime {
+    std.debug.assert(cell_count <= std.math.maxInt(u16)); // fish_cell is u16
+}
 
 const fish_cruise_speed: f32 = 2.5;
 const fish_flee_speed: f32 = 5.5;
@@ -34,23 +37,27 @@ const wall_margin: f32 = 30.0;
 const max_edge: f32 = world_size - 0.01;
 
 const no_prey = std.math.maxInt(u32);
+/// A shark's flee circle spans at most this many cells per axis.
+const threat_cells_per_axis: usize = @as(usize, @intFromFloat(2 * flee_radius / cell_size)) + 2;
 
-/// One set of per-entity arrays (structure of arrays).
+/// One set of per-entity arrays (structure of arrays). Positions need full precision
+/// across the world; velocity and phase fit in half floats, which keeps a fish at
+/// 14 bytes and cuts memory traffic in both the update and the GPU upload.
 pub const Bodies = struct {
     x: []f32,
     z: []f32,
-    vx: []f32,
-    vz: []f32,
+    vx: []f16,
+    vz: []f16,
     /// Swim animation phase in radians, advanced by speed.
-    phase: []f32,
+    phase: []f16,
 
-    fn alloc(gpa: std.mem.Allocator, n: usize) !Bodies {
+    pub fn alloc(gpa: std.mem.Allocator, n: usize) !Bodies {
         return .{
             .x = try gpa.alloc(f32, n),
             .z = try gpa.alloc(f32, n),
-            .vx = try gpa.alloc(f32, n),
-            .vz = try gpa.alloc(f32, n),
-            .phase = try gpa.alloc(f32, n),
+            .vx = try gpa.alloc(f16, n),
+            .vz = try gpa.alloc(f16, n),
+            .phase = try gpa.alloc(f16, n),
         };
     }
 
@@ -80,20 +87,22 @@ pub const Sim = struct {
     /// Double-buffered: `fish[cur]` is sorted by cell, the other is the scatter target.
     fish: [2]Bodies,
     cur: usize = 0,
-    fish_cell: []u32,
+    fish_cell: []u16,
     /// Per-task cell histograms, later turned into per-task scatter cursors.
     hist: []u32,
     /// `cell_start[c]..cell_start[c+1]` is the range of fish in cell `c` (row-major).
     cell_start: []u32,
 
+    /// Current direction at each cell corner (`flow_dim` x `flow_dim` nodes).
     flow_x: []f32,
     flow_z: []f32,
 
     sharks: Bodies,
-    shark_cell_start: []u32,
-    shark_cursor: []u32,
-    shark_sorted_x: []f32,
-    shark_sorted_z: []f32,
+    /// `threat_start[c]..threat_start[c+1]` holds the sharks whose flee circle overlaps cell `c`.
+    threat_start: []u32,
+    threat_cursor: []u32,
+    threat_x: []f32,
+    threat_z: []f32,
     shark_prey: []u32,
 
     time: f32 = 0,
@@ -103,22 +112,23 @@ pub const Sim = struct {
     timings: Timings = .{},
 
     pub fn create(gpa: std.mem.Allocator, io: Io, task_count: usize) !*Sim {
+        const max_threats = shark_count * threat_cells_per_axis * threat_cells_per_axis;
         const s = try gpa.create(Sim);
         s.* = .{
             .gpa = gpa,
             .io = io,
             .task_count = task_count,
             .fish = .{ try Bodies.alloc(gpa, fish_count), try Bodies.alloc(gpa, fish_count) },
-            .fish_cell = try gpa.alloc(u32, fish_count),
+            .fish_cell = try gpa.alloc(u16, fish_count),
             .hist = try gpa.alloc(u32, task_count * cell_count),
             .cell_start = try gpa.alloc(u32, cell_count + 1),
             .flow_x = try gpa.alloc(f32, flow_dim * flow_dim),
             .flow_z = try gpa.alloc(f32, flow_dim * flow_dim),
             .sharks = try Bodies.alloc(gpa, shark_count),
-            .shark_cell_start = try gpa.alloc(u32, shark_cell_count + 1),
-            .shark_cursor = try gpa.alloc(u32, shark_cell_count),
-            .shark_sorted_x = try gpa.alloc(f32, shark_count),
-            .shark_sorted_z = try gpa.alloc(f32, shark_count),
+            .threat_start = try gpa.alloc(u32, cell_count + 1),
+            .threat_cursor = try gpa.alloc(u32, cell_count),
+            .threat_x = try gpa.alloc(f32, max_threats),
+            .threat_z = try gpa.alloc(f32, max_threats),
             .shark_prey = try gpa.alloc(u32, shark_count),
             .rng = .init(0x1_000_000),
         };
@@ -129,16 +139,16 @@ pub const Sim = struct {
             f.x[i] = r.float(f32) * max_edge;
             f.z[i] = r.float(f32) * max_edge;
             const a = r.float(f32) * std.math.tau;
-            f.vx[i] = @cos(a) * fish_cruise_speed;
-            f.vz[i] = @sin(a) * fish_cruise_speed;
-            f.phase[i] = r.float(f32) * std.math.tau;
+            f.vx[i] = @floatCast(@cos(a) * fish_cruise_speed);
+            f.vz[i] = @floatCast(@sin(a) * fish_cruise_speed);
+            f.phase[i] = @floatCast(r.float(f32) * std.math.tau);
         }
         for (0..shark_count) |i| {
             s.sharks.x[i] = r.float(f32) * max_edge;
             s.sharks.z[i] = r.float(f32) * max_edge;
             s.sharks.vx[i] = 0;
             s.sharks.vz[i] = 0;
-            s.sharks.phase[i] = r.float(f32) * std.math.tau;
+            s.sharks.phase[i] = @floatCast(r.float(f32) * std.math.tau);
         }
 
         // A zero-length step sorts the fish so the grid is valid before the first frame.
@@ -156,10 +166,10 @@ pub const Sim = struct {
         gpa.free(s.cell_start);
         gpa.free(s.flow_x);
         gpa.free(s.flow_z);
-        gpa.free(s.shark_cell_start);
-        gpa.free(s.shark_cursor);
-        gpa.free(s.shark_sorted_x);
-        gpa.free(s.shark_sorted_z);
+        gpa.free(s.threat_start);
+        gpa.free(s.threat_cursor);
+        gpa.free(s.threat_x);
+        gpa.free(s.threat_z);
         gpa.free(s.shark_prey);
         gpa.destroy(s);
     }
@@ -174,17 +184,17 @@ pub const Sim = struct {
         const t0 = s.now();
 
         s.parallelFor(flow_dim, flowTask, s);
+        s.buildThreats();
         const t1 = s.now();
 
-        s.buildSharkGrid();
-        s.parallelFor(fish_count, fishTask, s);
-        const t2 = s.now();
-
+        s.parallelFor(fish_count, cellTask, s);
         s.parallelFor(cell_count, cellTotalsTask, s);
         s.cell_start[0] = 0;
         for (1..cell_count + 1) |c| s.cell_start[c] += s.cell_start[c - 1];
         s.parallelFor(cell_count, cellCursorsTask, s);
-        s.parallelFor(fish_count, scatterTask, s);
+        const t2 = s.now();
+
+        s.parallelFor(fish_count, fishTask, s);
         s.cur ^= 1;
         const t3 = s.now();
 
@@ -194,8 +204,8 @@ pub const Sim = struct {
 
         s.timings = .{
             .flow = ms(t0, t1),
-            .fish = ms(t1, t2),
-            .sort = ms(t2, t3),
+            .sort = ms(t1, t2),
+            .fish = ms(t2, t3),
             .sharks = ms(t3, t4),
             .total = ms(t0, t4),
         };
@@ -217,19 +227,29 @@ pub const Sim = struct {
         return Io.Timestamp.now(s.io, .awake);
     }
 
-    fn buildSharkGrid(s: *Sim) void {
+    /// Lists each shark in every cell its flee circle overlaps, so a fish only has to scan
+    /// its own cell's list. For most fish that list is empty.
+    fn buildThreats(s: *Sim) void {
         const sh = s.sharks;
-        const start = s.shark_cell_start;
+        const start = s.threat_start;
         @memset(start, 0);
-        for (0..shark_count) |i| start[sharkCell(sh.x[i], sh.z[i]) + 1] += 1;
-        for (1..shark_cell_count + 1) |c| start[c] += start[c - 1];
-        @memcpy(s.shark_cursor, start[0..shark_cell_count]);
         for (0..shark_count) |i| {
-            const c = sharkCell(sh.x[i], sh.z[i]);
-            const d = s.shark_cursor[c];
-            s.shark_cursor[c] = d + 1;
-            s.shark_sorted_x[d] = sh.x[i];
-            s.shark_sorted_z[d] = sh.z[i];
+            const r = threatCells(sh.x[i], sh.z[i]);
+            for (r.z0..r.z1 + 1) |cz| for (r.x0..r.x1 + 1) |cx| {
+                start[cz * grid_dim + cx + 1] += 1;
+            };
+        }
+        for (1..cell_count + 1) |c| start[c] += start[c - 1];
+        @memcpy(s.threat_cursor, start[0..cell_count]);
+        for (0..shark_count) |i| {
+            const r = threatCells(sh.x[i], sh.z[i]);
+            for (r.z0..r.z1 + 1) |cz| for (r.x0..r.x1 + 1) |cx| {
+                const c = cz * grid_dim + cx;
+                const d = s.threat_cursor[c];
+                s.threat_cursor[c] = d + 1;
+                s.threat_x[d] = sh.x[i];
+                s.threat_z[d] = sh.z[i];
+            };
         }
     }
 
@@ -238,34 +258,12 @@ pub const Sim = struct {
         const r = s.rng.random();
         for (s.shark_prey) |prey| {
             if (prey == no_prey) continue;
-            // Respawn somewhere else so the population stays at one million. The fish
-            // stays in its old grid slot until next frame's sort, which is harmless.
+            // Respawn somewhere else so the population stays constant. The fish stays in
+            // its old grid slot until next frame's sort, which is harmless.
             f.x[prey] = r.float(f32) * max_edge;
             f.z[prey] = r.float(f32) * max_edge;
             s.eaten_total += 1;
         }
-    }
-
-    /// Bilinear sample of the current field at a world position.
-    fn sampleFlow(s: *const Sim, x: f32, z: f32) [2]f32 {
-        const gx = x * (1.0 / cell_size);
-        const gz = z * (1.0 / cell_size);
-        const ix: usize = @min(@as(usize, @intFromFloat(gx)), grid_dim - 1);
-        const iz: usize = @min(@as(usize, @intFromFloat(gz)), grid_dim - 1);
-        const fx = gx - @as(f32, @floatFromInt(ix));
-        const fz = gz - @as(f32, @floatFromInt(iz));
-        const n00 = iz * flow_dim + ix;
-        const n10 = n00 + 1;
-        const n01 = n00 + flow_dim;
-        const n11 = n01 + 1;
-        const w00 = (1 - fx) * (1 - fz);
-        const w10 = fx * (1 - fz);
-        const w01 = (1 - fx) * fz;
-        const w11 = fx * fz;
-        return .{
-            s.flow_x[n00] * w00 + s.flow_x[n10] * w10 + s.flow_x[n01] * w01 + s.flow_x[n11] * w11,
-            s.flow_z[n00] * w00 + s.flow_z[n10] * w10 + s.flow_z[n01] * w01 + s.flow_z[n11] * w11,
-        };
     }
 };
 
@@ -279,14 +277,20 @@ pub fn fishCell(x: f32, z: f32) u32 {
     return cz * @as(u32, grid_dim) + cx;
 }
 
-fn sharkCell(x: f32, z: f32) usize {
-    const cx: usize = @intFromFloat(x * (1.0 / shark_cell_size));
-    const cz: usize = @intFromFloat(z * (1.0 / shark_cell_size));
-    return cz * shark_grid_dim + cx;
+const CellRange = struct { x0: usize, x1: usize, z0: usize, z1: usize };
+
+/// The cells overlapped by the square around a shark's flee circle.
+fn threatCells(x: f32, z: f32) CellRange {
+    return .{
+        .x0 = @intFromFloat(@max(x - flee_radius, 0) * (1.0 / cell_size)),
+        .x1 = @intFromFloat(@min(x + flee_radius, max_edge) * (1.0 / cell_size)),
+        .z0 = @intFromFloat(@max(z - flee_radius, 0) * (1.0 / cell_size)),
+        .z1 = @intFromFloat(@min(z + flee_radius, max_edge) * (1.0 / cell_size)),
+    };
 }
 
-/// Ocean currents: the curl of a sum of moving sine waves. Being divergence-free, it moves
-/// fish around in swirls without piling them up in sinks.
+/// Ocean currents: the curl of a sum of moving sine waves, sampled at cell corners. Being
+/// divergence-free, it moves fish around in swirls without piling them up in sinks.
 fn flowTask(s: *Sim, _: usize, begin: usize, end: usize) void {
     const t = s.time;
     for (begin..end) |nz| {
@@ -309,53 +313,77 @@ fn flowTask(s: *Sim, _: usize, begin: usize, end: usize) void {
     }
 }
 
+/// Bilinear sample of the current at a position inside cell `c`. Interpolating matters: a
+/// per-cell constant current shears at cell borders and draws visible grid lines of fish.
+fn sampleFlow(s: *const Sim, x: f32, z: f32, c: usize) [2]f32 {
+    const iz = c / grid_dim;
+    const ix = c - iz * grid_dim;
+    const fx = std.math.clamp(x * (1.0 / cell_size) - @as(f32, @floatFromInt(ix)), 0, 1);
+    const fz = std.math.clamp(z * (1.0 / cell_size) - @as(f32, @floatFromInt(iz)), 0, 1);
+    const n00 = iz * flow_dim + ix;
+    const n01 = n00 + flow_dim;
+    const top_x = s.flow_x[n00] + (s.flow_x[n00 + 1] - s.flow_x[n00]) * fx;
+    const top_z = s.flow_z[n00] + (s.flow_z[n00 + 1] - s.flow_z[n00]) * fx;
+    const bot_x = s.flow_x[n01] + (s.flow_x[n01 + 1] - s.flow_x[n01]) * fx;
+    const bot_z = s.flow_z[n01] + (s.flow_z[n01 + 1] - s.flow_z[n01]) * fx;
+    return .{ top_x + (bot_x - top_x) * fz, top_z + (bot_z - top_z) * fz };
+}
+
 fn wallPush(p: f32) f32 {
     if (p < wall_margin) return (wall_margin - p) / wall_margin;
     if (p > world_size - wall_margin) return -(p - (world_size - wall_margin)) / wall_margin;
     return 0;
 }
 
-fn fishTask(s: *Sim, task: usize, begin: usize, end: usize) void {
+/// Pass 1 of the sort: bucket every fish by its current cell.
+fn cellTask(s: *Sim, task: usize, begin: usize, end: usize) void {
     const f = s.fish[s.cur];
     const hist = s.hist[task * cell_count ..][0..cell_count];
     @memset(hist, 0);
+    for (begin..end) |i| {
+        const c = fishCell(f.x[i], f.z[i]);
+        s.fish_cell[i] = @intCast(c);
+        hist[c] += 1;
+    }
+}
+
+/// Updates each fish and writes it to its sorted slot. Uses the same chunks as
+/// `cellTask`, so each task consumes exactly the cursors its histogram produced.
+fn fishTask(s: *Sim, task: usize, begin: usize, end: usize) void {
+    const f = s.fish[s.cur];
+    const dst = s.fish[s.cur ^ 1];
+    const cursor = s.hist[task * cell_count ..][0..cell_count];
     const dt = s.dt;
     const steer = @min(1.0, fish_accel * dt);
     const flee_r2 = flee_radius * flee_radius;
 
     for (begin..end) |i| {
+        const c = s.fish_cell[i];
         var x = f.x[i];
         var z = f.z[i];
-        var vx = f.vx[i];
-        var vz = f.vz[i];
+        var vx: f32 = f.vx[i];
+        var vz: f32 = f.vz[i];
 
         // Cruise along the current at a roughly constant speed.
-        const flow = s.sampleFlow(x, z);
-        const flow_len = @sqrt(flow[0] * flow[0] + flow[1] * flow[1]);
-        const flow_scale = fish_cruise_speed / @max(flow_len, 0.5);
-        var dx = flow[0] * flow_scale + wallPush(x) * fish_cruise_speed * 2;
-        var dz = flow[1] * flow_scale + wallPush(z) * fish_cruise_speed * 2;
+        const flow = sampleFlow(s, x, z, c);
+        const flow_x = flow[0];
+        const flow_z = flow[1];
+        const flow_scale = fish_cruise_speed / @max(@sqrt(flow_x * flow_x + flow_z * flow_z), 0.5);
+        var dx = flow_x * flow_scale + wallPush(x) * fish_cruise_speed * 2;
+        var dz = flow_z * flow_scale + wallPush(z) * fish_cruise_speed * 2;
 
-        // Flee the nearest shark in the 3x3 shark cells around us.
-        const scx: usize = @intFromFloat(x * (1.0 / shark_cell_size));
-        const scz: usize = @intFromFloat(z * (1.0 / shark_cell_size));
-        const x0 = scx -| 1;
-        const x1 = @min(scx + 1, shark_grid_dim - 1);
+        // Flee the nearest shark that can reach this cell.
         var best_d2: f32 = flee_r2;
         var away_x: f32 = 0;
         var away_z: f32 = 0;
-        for ((scz -| 1)..@min(scz + 1, shark_grid_dim - 1) + 1) |cz| {
-            const row = cz * shark_grid_dim;
-            // Cells in a row are contiguous, so scan the whole row segment at once.
-            for (s.shark_cell_start[row + x0]..s.shark_cell_start[row + x1 + 1]) |k| {
-                const ax = x - s.shark_sorted_x[k];
-                const az = z - s.shark_sorted_z[k];
-                const d2 = ax * ax + az * az;
-                if (d2 < best_d2) {
-                    best_d2 = d2;
-                    away_x = ax;
-                    away_z = az;
-                }
+        for (s.threat_start[c]..s.threat_start[c + 1]) |k| {
+            const ax = x - s.threat_x[k];
+            const az = z - s.threat_z[k];
+            const d2 = ax * ax + az * az;
+            if (d2 < best_d2) {
+                best_d2 = d2;
+                away_x = ax;
+                away_z = az;
             }
         }
         if (best_d2 < flee_r2) {
@@ -377,18 +405,16 @@ fn fishTask(s: *Sim, task: usize, begin: usize, end: usize) void {
         x = std.math.clamp(x + vx * dt, 0, max_edge);
         z = std.math.clamp(z + vz * dt, 0, max_edge);
 
-        var phase = f.phase[i] + dt * (3.0 + 2.0 * @sqrt(speed2));
+        var phase = @as(f32, f.phase[i]) + dt * (3.0 + 2.0 * @sqrt(speed2));
         if (phase > std.math.tau) phase -= std.math.tau;
 
-        f.x[i] = x;
-        f.z[i] = z;
-        f.vx[i] = vx;
-        f.vz[i] = vz;
-        f.phase[i] = phase;
-
-        const c = fishCell(x, z);
-        s.fish_cell[i] = c;
-        hist[c] += 1;
+        const d = cursor[c];
+        cursor[c] = d + 1;
+        dst.x[d] = x;
+        dst.z[d] = z;
+        dst.vx[d] = @floatCast(vx);
+        dst.vz[d] = @floatCast(vz);
+        dst.phase[d] = @floatCast(phase);
     }
 }
 
@@ -414,22 +440,6 @@ fn cellCursorsTask(s: *Sim, _: usize, begin: usize, end: usize) void {
     }
 }
 
-fn scatterTask(s: *Sim, task: usize, begin: usize, end: usize) void {
-    const src = s.fish[s.cur];
-    const dst = s.fish[s.cur ^ 1];
-    const cursor = s.hist[task * cell_count ..][0..cell_count];
-    for (begin..end) |i| {
-        const c = s.fish_cell[i];
-        const d = cursor[c];
-        cursor[c] = d + 1;
-        dst.x[d] = src.x[i];
-        dst.z[d] = src.z[i];
-        dst.vx[d] = src.vx[i];
-        dst.vz[d] = src.vz[i];
-        dst.phase[d] = src.phase[i];
-    }
-}
-
 fn sharkTask(s: *Sim, _: usize, begin: usize, end: usize) void {
     const f = s.fish[s.cur];
     const sh = s.sharks;
@@ -439,8 +449,8 @@ fn sharkTask(s: *Sim, _: usize, begin: usize, end: usize) void {
     for (begin..end) |i| {
         var x = sh.x[i];
         var z = sh.z[i];
-        var vx = sh.vx[i];
-        var vz = sh.vz[i];
+        var vx: f32 = sh.vx[i];
+        var vz: f32 = sh.vz[i];
 
         // Nearest fish in the 3x3 fish cells around us.
         const cx: usize = @intFromFloat(x * (1.0 / cell_size));
@@ -451,6 +461,7 @@ fn sharkTask(s: *Sim, _: usize, begin: usize, end: usize) void {
         var best: u32 = no_prey;
         for ((cz -| 1)..@min(cz + 1, grid_dim - 1) + 1) |row_z| {
             const row = row_z * grid_dim;
+            // Cells in a row are contiguous, so scan the whole row segment at once.
             for (s.cell_start[row + x0]..s.cell_start[row + x1 + 1]) |k| {
                 const ax = f.x[k] - x;
                 const az = f.z[k] - z;
@@ -469,7 +480,8 @@ fn sharkTask(s: *Sim, _: usize, begin: usize, end: usize) void {
             dx = (f.x[best] - x) / d * shark_chase_speed;
             dz = (f.z[best] - z) / d * shark_chase_speed;
         } else {
-            const flow = s.sampleFlow(x, z);
+            const c = fishCell(x, z);
+            const flow = sampleFlow(s, x, z, c);
             dx = flow[0] * shark_cruise_speed;
             dz = flow[1] * shark_cruise_speed;
         }
@@ -488,13 +500,13 @@ fn sharkTask(s: *Sim, _: usize, begin: usize, end: usize) void {
         x = std.math.clamp(x + vx * dt, 0, max_edge);
         z = std.math.clamp(z + vz * dt, 0, max_edge);
 
-        var phase = sh.phase[i] + dt * (2.0 + 0.6 * @sqrt(speed2));
+        var phase = @as(f32, sh.phase[i]) + dt * (2.0 + 0.6 * @sqrt(speed2));
         if (phase > std.math.tau) phase -= std.math.tau;
 
         sh.x[i] = x;
         sh.z[i] = z;
-        sh.vx[i] = vx;
-        sh.vz[i] = vz;
-        sh.phase[i] = phase;
+        sh.vx[i] = @floatCast(vx);
+        sh.vz[i] = @floatCast(vz);
+        sh.phase[i] = @floatCast(phase);
     }
 }

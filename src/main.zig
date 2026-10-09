@@ -4,7 +4,7 @@ const sim = @import("sim.zig");
 const render = @import("render.zig");
 
 const min_height: f32 = 6;
-const max_height: f32 = 2600;
+const max_height: f32 = 8500;
 /// Camera sits behind the target by this fraction of its height, giving a ~70 degree pitch.
 const camera_back: f32 = 0.35;
 const fovy: f32 = 45;
@@ -29,7 +29,8 @@ pub fn main(init: std.process.Init) !void {
     rl.initWindow(1600, 900, "1 Million Objects");
     defer rl.closeWindow();
 
-    const task_count = opts.threads orelse (std.Thread.getCpuCount() catch 4);
+    // Leave one hardware thread for the main thread, which uploads and draws while the sim runs.
+    const task_count = opts.threads orelse @max(1, (std.Thread.getCpuCount() catch 4) - 1);
     const s = try sim.Sim.create(gpa, init.io, task_count);
     defer s.destroy();
     var renderer = try render.Renderer.init(gpa);
@@ -43,7 +44,7 @@ pub fn main(init: std.process.Init) !void {
 
     var frame: u32 = 0;
     var sum_sim: sim.Timings = .{};
-    var sum_gather: f32 = 0;
+    var sum_cull: f32 = 0;
     var sum_draw: f32 = 0;
     var sum_frame: f32 = 0;
 
@@ -75,8 +76,6 @@ pub fn main(init: std.process.Init) !void {
         target_x = std.math.clamp(target_x, 0, sim.world_size);
         target_z = std.math.clamp(target_z, 0, sim.world_size);
 
-        // Simulate
-        if (!paused) s.step(dt);
         if (follow) |i| {
             target_x = s.sharks.x[i];
             target_z = s.sharks.z[i];
@@ -90,37 +89,53 @@ pub fn main(init: std.process.Init) !void {
             .projection = .perspective,
         };
 
-        // Draw
+        // Cull and snapshot the current state, then simulate the next state on another
+        // thread while this one uploads and draws. Nothing below may touch `s` until the
+        // join except through what `prepare` captured.
+        renderer.prepare(s, camera);
+        const hud: HudSnapshot = .{ .timings = s.timings, .eaten = s.eaten_total };
+        const sim_thread: ?std.Thread = if (paused) null else try std.Thread.spawn(.{}, sim.Sim.step, .{ s, dt });
+
         rl.beginDrawing();
         rl.clearBackground(ocean);
+        // raylib's default far plane (4000) would clip the ocean when zoomed out. Scaling
+        // both planes with height also keeps depth precision constant across zoom levels.
+        rl.gl.rlSetClipPlanes(height * 0.05, height * 4);
         rl.beginMode3D(camera);
+        // The seabed is drawn first and without depth, so it can never z-fight the fish.
+        // From high up the depth buffer cannot separate the two and draws bands of seabed.
+        rl.gl.rlDisableDepthTest();
         rl.drawPlane(.{ .x = sim.world_size / 2, .y = -3, .z = sim.world_size / 2 }, .{ .x = sim.world_size, .y = sim.world_size }, seabed);
-        renderer.draw(s, camera);
+        rl.gl.rlDrawRenderBatchActive();
+        rl.gl.rlEnableDepthTest();
+        renderer.draw(s);
         rl.endMode3D();
-        drawHud(s, &renderer, height, paused, follow != null);
+        drawHud(hud, &renderer, height, paused, follow != null);
         rl.endDrawing();
+
+        if (sim_thread) |t| t.join();
 
         sum_sim.flow += s.timings.flow;
         sum_sim.fish += s.timings.fish;
         sum_sim.sort += s.timings.sort;
         sum_sim.sharks += s.timings.sharks;
         sum_sim.total += s.timings.total;
-        sum_gather += renderer.stats.gather_ms;
-        sum_draw += renderer.stats.upload_ms;
+        sum_cull += renderer.stats.cull_ms;
+        sum_draw += renderer.stats.draw_ms;
         sum_frame += rl.getFrameTime() * 1000;
 
         if (opts.shot) |path| if (frame + 1 == opts.frames) {
             rl.takeScreenshot(path);
             const n: f32 = @floatFromInt(opts.frames);
+            const st = renderer.stats;
             std.debug.print(
-                "frames={d} threads={d} visible_fish={d} visible_sharks={d} tris={d} lod={s}\n" ++
-                    "avg ms: frame={d:.2} sim={d:.2} (flow={d:.2} fish={d:.2} sort={d:.2} sharks={d:.2}) cull+gather={d:.2} upload+draw={d:.2}\n",
+                "frames={d} threads={d} visible_fish={d} visible_sharks={d} runs={d} tris={d} lod={s}\n" ++
+                    "avg ms: frame={d:.2} sim={d:.2} (flow={d:.2} sort={d:.2} fish={d:.2} sharks={d:.2}) cull={d:.2} upload+draw={d:.2}\n",
                 .{
-                    opts.frames,                   task_count,                    renderer.stats.visible_fish,
-                    renderer.stats.visible_sharks, renderer.stats.fish_triangles, if (renderer.stats.low_poly) "low" else "high",
-                    sum_frame / n,                 sum_sim.total / n,             sum_sim.flow / n,
-                    sum_sim.fish / n,              sum_sim.sort / n,              sum_sim.sharks / n,
-                    sum_gather / n,                sum_draw / n,
+                    opts.frames,       task_count,        st.visible_fish,   st.visible_sharks,
+                    st.runs,           st.fish_triangles, @tagName(st.lod),  sum_frame / n,
+                    sum_sim.total / n, sum_sim.flow / n,  sum_sim.sort / n,  sum_sim.fish / n,
+                    sum_sim.sharks / n, sum_cull / n,     sum_draw / n,
                 },
             );
             break;
@@ -166,19 +181,25 @@ fn nearestShark(s: *const sim.Sim, x: f32, z: f32) usize {
     return best;
 }
 
-fn drawHud(s: *const sim.Sim, r: *const render.Renderer, height: f32, paused: bool, following: bool) void {
+/// Simulation values the HUD shows, copied before the step starts running in the background.
+const HudSnapshot = struct {
+    timings: sim.Timings,
+    eaten: u64,
+};
+
+fn drawHud(hud: HudSnapshot, r: *const render.Renderer, height: f32, paused: bool, following: bool) void {
     var buf: [256]u8 = undefined;
     const st = r.stats;
-    const t = s.timings;
+    const t = hud.timings;
     rl.drawRectangle(8, 8, 560, 190, rl.fade(.black, 0.55));
     var y: i32 = 16;
     const items = .{
         .{ "{d} FPS  ({d:.2} ms/frame)", .{ rl.getFPS(), rl.getFrameTime() * 1000 } },
-        .{ "{d} fish + {d} sharks, {d} eaten", .{ sim.fish_count, sim.shark_count, s.eaten_total } },
-        .{ "visible: {d} fish, {d} sharks ({d} grid rows)", .{ st.visible_fish, st.visible_sharks, st.rows } },
-        .{ "fish mesh: {s}, {d} triangles", .{ if (st.low_poly) "low-poly" else "full model", st.fish_triangles } },
-        .{ "sim {d:.2} ms: flow {d:.2}  fish {d:.2}  sort {d:.2}  sharks {d:.2}", .{ t.total, t.flow, t.fish, t.sort, t.sharks } },
-        .{ "cull+gather {d:.2} ms   upload+draw {d:.2} ms", .{ st.gather_ms, st.upload_ms } },
+        .{ "{d} fish + {d} sharks, {d} eaten", .{ sim.fish_count, sim.shark_count, hud.eaten } },
+        .{ "visible: {d} fish, {d} sharks ({d} upload runs)", .{ st.visible_fish, st.visible_sharks, st.runs } },
+        .{ "fish mesh: {s}, {d} triangles", .{ @tagName(st.lod), st.fish_triangles } },
+        .{ "sim {d:.2} ms: flow {d:.2}  sort {d:.2}  fish {d:.2}  sharks {d:.2}", .{ t.total, t.flow, t.sort, t.fish, t.sharks } },
+        .{ "cull {d:.2} ms   upload+draw {d:.2} ms", .{ st.cull_ms, st.draw_ms } },
         .{ "camera height {d:.0}{s}{s}", .{ height, if (paused) "   PAUSED" else "", if (following) "   following shark" else "" } },
         .{ "WASD/drag pan  wheel zoom  F follow shark  Space pause", .{} },
     };
